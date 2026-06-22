@@ -37,7 +37,7 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
 
   private BluetoothDevice bluetoothDevice;
   private BluetoothGatt bluetoothGatt;
-  private List<TiBluetoothServiceProxy> services;
+  private List<TiBluetoothServiceProxy> services = new ArrayList<>();
   private ScanRecord scanRecord;
 
   public TiBluetoothPeripheralProxy(BluetoothDevice bluetoothDevice,
@@ -203,11 +203,7 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
   @Kroll.getProperty
   @Kroll.method
   public Object[] getServices() {
-    if (services == null){
-      return new Object[0];
-    } else {
-      return services.toArray();
-    }
+    return services.toArray();
   }
 
   @Kroll.method
