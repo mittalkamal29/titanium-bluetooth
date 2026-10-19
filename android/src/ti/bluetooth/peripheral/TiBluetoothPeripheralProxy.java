@@ -4,6 +4,7 @@ import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCallback;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.ScanRecord;
@@ -12,6 +13,7 @@ import android.os.ParcelUuid;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import org.appcelerator.kroll.KrollDict;
 import org.appcelerator.kroll.KrollProxy;
 import org.appcelerator.kroll.annotations.Kroll;
@@ -33,7 +35,16 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
       "didWriteValueForCharacteristic";
   private static final String DID_READ_VALUE_FOR_CHARACTERISTIC =
       "didReadValueForCharacteristic";
+  private static final String DID_UPDATE_NOTIFICATION_STATE_FOR_CHARACTERISTIC =
+      "didUpdateNotificationStateForCharacteristic";
   private static final String SERVICE_KEY = "service";
+  private static final String LCAT = "TiBluetoothPeripheral";
+
+  // Client Characteristic Configuration descriptor. A peripheral only starts sending
+  // notifications/indications once this is written; iOS writes it inside setNotifyValue,
+  // Android leaves it to the app.
+  private static final UUID CCCD_UUID =
+      UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
   private BluetoothDevice bluetoothDevice;
   private BluetoothGatt bluetoothGatt;
@@ -110,6 +121,29 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
         firePeripheralEvent(DID_READ_VALUE_FOR_CHARACTERISTIC,
                             TiBluetoothPeripheralProxy.this, null,
                             new TiBluetoothCharacteristicProxy(characteristic));
+      }
+
+      @Override
+      public void onDescriptorWrite(BluetoothGatt gatt,
+                                    BluetoothGattDescriptor descriptor,
+                                    int status) {
+        super.onDescriptorWrite(gatt, descriptor, status);
+
+        if (!CCCD_UUID.equals(descriptor.getUuid())) {
+          return;
+        }
+
+        // Same event as iOS, so apps can confirm the subscription on both platforms
+        KrollDict kd = new KrollDict();
+        kd.put("peripheral", TiBluetoothPeripheralProxy.this);
+        kd.put("characteristic", new TiBluetoothCharacteristicProxy(
+                                      descriptor.getCharacteristic()));
+
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+          kd.put("error", "GATT status " + status);
+        }
+
+        fireEvent(DID_UPDATE_NOTIFICATION_STATE_FOR_CHARACTERISTIC, kd);
       }
 
       @Override
@@ -209,8 +243,41 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
   @Kroll.method
   public void setNotifyValueForCharacteristic(
       boolean enabled, TiBluetoothCharacteristicProxy characteristic) {
-    bluetoothGatt.setCharacteristicNotification(
-        characteristic.getCharacteristic(), enabled);
+    BluetoothGattCharacteristic gattCharacteristic =
+        characteristic.getCharacteristic();
+
+    bluetoothGatt.setCharacteristicNotification(gattCharacteristic, enabled);
+
+    // setCharacteristicNotification() is local to the phone; the peripheral is told
+    // through its CCCD. Without this write, peripherals that honour the CCCD never notify.
+    BluetoothGattDescriptor descriptor =
+        gattCharacteristic.getDescriptor(CCCD_UUID);
+
+    if (descriptor == null) {
+      Log.w(LCAT, "No CCCD on characteristic " + gattCharacteristic.getUuid());
+      return;
+    }
+
+    int properties = gattCharacteristic.getProperties();
+    byte[] value;
+
+    if (!enabled) {
+      value = BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE;
+    } else if ((properties & BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+      value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE;
+    } else if ((properties & BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0) {
+      value = BluetoothGattDescriptor.ENABLE_INDICATION_VALUE;
+    } else {
+      Log.w(LCAT, "Characteristic " + gattCharacteristic.getUuid()
+                      + " supports neither notify nor indicate");
+      return;
+    }
+
+    descriptor.setValue(value);
+
+    if (!bluetoothGatt.writeDescriptor(descriptor)) {
+      Log.w(LCAT, "CCCD write was not started for " + gattCharacteristic.getUuid());
+    }
   }
 
 
