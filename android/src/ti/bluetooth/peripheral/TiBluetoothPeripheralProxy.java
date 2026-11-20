@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.ScanRecord;
 import android.content.Context;
 import android.os.ParcelUuid;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,7 @@ import org.appcelerator.kroll.KrollProxy;
 import org.appcelerator.kroll.annotations.Kroll;
 import org.appcelerator.kroll.common.Log;
 import org.appcelerator.titanium.TiBlob;
+import org.appcelerator.titanium.util.TiConvert;
 import ti.bluetooth.TiBluetoothModule;
 import ti.bluetooth.gatt.TiBluetoothCharacteristicProxy;
 import ti.bluetooth.gatt.TiBluetoothServiceProxy;
@@ -51,6 +53,16 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
   private List<TiBluetoothServiceProxy> services = new ArrayList<>();
   private ScanRecord scanRecord;
 
+  // Android runs one GATT operation at a time: a read or write started while another is
+  // in flight is refused (the call returns false and no callback ever fires). Reads,
+  // writes and CCCD writes therefore wait here for the previous operation's callback.
+  private interface GattOperation {
+    boolean start();
+  }
+
+  private final ArrayDeque<GattOperation> gattQueue = new ArrayDeque<>();
+  private boolean gattBusy = false;
+
   public TiBluetoothPeripheralProxy(BluetoothDevice bluetoothDevice,
                                     ScanRecord scanRecord) {
     this.bluetoothDevice = bluetoothDevice;
@@ -67,6 +79,12 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
       public void onConnectionStateChange(BluetoothGatt gatt, int status,
                                           int newState) {
         super.onConnectionStateChange(gatt, status, newState);
+
+        if (status != BluetoothGatt.GATT_SUCCESS
+            || newState == BluetoothProfile.STATE_DISCONNECTED) {
+          // the link is gone, so no queued operation's callback will ever arrive
+          clearGattQueue();
+        }
 
         if (status == BluetoothGatt.GATT_SUCCESS) {
           if (newState == BluetoothProfile.STATE_CONNECTED) {
@@ -110,6 +128,8 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
         firePeripheralEvent(DID_WRITE_VALUE_FOR_CHARACTERISTIC,
                             TiBluetoothPeripheralProxy.this, null,
                             new TiBluetoothCharacteristicProxy(characteristic));
+
+        completeGattOperation();
       }
 
       @Override
@@ -121,6 +141,8 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
         firePeripheralEvent(DID_READ_VALUE_FOR_CHARACTERISTIC,
                             TiBluetoothPeripheralProxy.this, null,
                             new TiBluetoothCharacteristicProxy(characteristic));
+
+        completeGattOperation();
       }
 
       @Override
@@ -128,6 +150,8 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
                                     BluetoothGattDescriptor descriptor,
                                     int status) {
         super.onDescriptorWrite(gatt, descriptor, status);
+
+        completeGattOperation();
 
         if (!CCCD_UUID.equals(descriptor.getUuid())) {
           return;
@@ -160,8 +184,45 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
   }
 
   public void disconnectPeripheral() {
+    clearGattQueue();
     bluetoothGatt.disconnect();
     bluetoothGatt.close();
+  }
+
+  private synchronized void enqueueGattOperation(GattOperation operation) {
+    gattQueue.add(operation);
+    if (!gattBusy) {
+      startNextGattOperation();
+    }
+  }
+
+  private synchronized void completeGattOperation() {
+    gattBusy = false;
+    startNextGattOperation();
+  }
+
+  private synchronized void clearGattQueue() {
+    gattQueue.clear();
+    gattBusy = false;
+  }
+
+  // Starts queued operations until one is accepted. One the stack refuses gets no callback,
+  // so it must not hold the queue.
+  private synchronized void startNextGattOperation() {
+    while (!gattBusy && !gattQueue.isEmpty()) {
+      GattOperation operation = gattQueue.poll();
+      boolean started = false;
+      try {
+        started = bluetoothGatt != null && operation.start();
+      } catch (Exception e) {
+        Log.w(LCAT, "GATT operation threw: " + e.getMessage());
+      }
+      if (started) {
+        gattBusy = true;
+      } else {
+        Log.w(LCAT, "GATT operation was not started, moving to the next one");
+      }
+    }
   }
 
   private List<TiBluetoothServiceProxy>
@@ -240,17 +301,27 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
     return services.toArray();
   }
 
+  /**
+   * @param writeDescriptor optional, default true. false only enables delivery on the phone
+   *     and skips the CCCD write (the 4.1.0 behaviour), for peripherals that notify without
+   *     it and misbehave when it is written.
+   */
   @Kroll.method
   public void setNotifyValueForCharacteristic(
-      boolean enabled, TiBluetoothCharacteristicProxy characteristic) {
+      boolean enabled, TiBluetoothCharacteristicProxy characteristic,
+      @Kroll.argument(optional = true) Object writeDescriptor) {
     BluetoothGattCharacteristic gattCharacteristic =
         characteristic.getCharacteristic();
 
     bluetoothGatt.setCharacteristicNotification(gattCharacteristic, enabled);
 
+    if (writeDescriptor != null && !TiConvert.toBoolean(writeDescriptor, true)) {
+      return;
+    }
+
     // setCharacteristicNotification() is local to the phone; the peripheral is told
     // through its CCCD. Without this write, peripherals that honour the CCCD never notify.
-    BluetoothGattDescriptor descriptor =
+    final BluetoothGattDescriptor descriptor =
         gattCharacteristic.getDescriptor(CCCD_UUID);
 
     if (descriptor == null) {
@@ -273,17 +344,24 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
       return;
     }
 
-    descriptor.setValue(value);
+    final byte[] cccdValue = value;
 
-    if (!bluetoothGatt.writeDescriptor(descriptor)) {
-      Log.w(LCAT, "CCCD write was not started for " + gattCharacteristic.getUuid());
-    }
+    enqueueGattOperation(() -> {
+      descriptor.setValue(cccdValue);
+      boolean started = bluetoothGatt.writeDescriptor(descriptor);
+      if (!started) {
+        Log.w(LCAT, "CCCD write was not started for " + gattCharacteristic.getUuid());
+      }
+      return started;
+    });
   }
 
 
   @Kroll.method
   public void readValueForCharacteristic(TiBluetoothCharacteristicProxy characteristic) {
-    bluetoothGatt.readCharacteristic(characteristic.getCharacteristic());
+    final BluetoothGattCharacteristic gattCharacteristic = characteristic.getCharacteristic();
+
+    enqueueGattOperation(() -> bluetoothGatt.readCharacteristic(gattCharacteristic));
   }
 
   @Kroll.method
@@ -291,11 +369,14 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
       TiBlob value,
       TiBluetoothCharacteristicProxy tiBluetoothCharacteristicProxy,
       int writeType) {
-    BluetoothGattCharacteristic characteristic =
+    final BluetoothGattCharacteristic characteristic =
         tiBluetoothCharacteristicProxy.getCharacteristic();
+    final byte[] bytes = value.getBytes();
 
-    characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
-    characteristic.setValue(value.getBytes());
-    bluetoothGatt.writeCharacteristic(characteristic);
+    enqueueGattOperation(() -> {
+      characteristic.setWriteType(BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT);
+      characteristic.setValue(bytes);
+      return bluetoothGatt.writeCharacteristic(characteristic);
+    });
   }
 }
