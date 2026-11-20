@@ -49,7 +49,9 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
       UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
   private BluetoothDevice bluetoothDevice;
-  private BluetoothGatt bluetoothGatt;
+  // the current connection; a reconnect creates a new BluetoothGatt, and the old one can still
+  // deliver late callbacks, which must not touch the queue of the new one
+  private volatile BluetoothGatt bluetoothGatt;
   private List<TiBluetoothServiceProxy> services = new ArrayList<>();
   private ScanRecord scanRecord;
 
@@ -80,8 +82,9 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
                                           int newState) {
         super.onConnectionStateChange(gatt, status, newState);
 
-        if (status != BluetoothGatt.GATT_SUCCESS
-            || newState == BluetoothProfile.STATE_DISCONNECTED) {
+        if ((status != BluetoothGatt.GATT_SUCCESS
+             || newState == BluetoothProfile.STATE_DISCONNECTED)
+            && (bluetoothGatt == null || gatt == bluetoothGatt)) {
           // the link is gone, so no queued operation's callback will ever arrive
           clearGattQueue();
         }
@@ -129,7 +132,7 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
                             TiBluetoothPeripheralProxy.this, null,
                             new TiBluetoothCharacteristicProxy(characteristic));
 
-        completeGattOperation();
+        completeGattOperation(gatt);
       }
 
       @Override
@@ -142,7 +145,7 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
                             TiBluetoothPeripheralProxy.this, null,
                             new TiBluetoothCharacteristicProxy(characteristic));
 
-        completeGattOperation();
+        completeGattOperation(gatt);
       }
 
       @Override
@@ -151,7 +154,7 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
                                     int status) {
         super.onDescriptorWrite(gatt, descriptor, status);
 
-        completeGattOperation();
+        completeGattOperation(gatt);
 
         if (!CCCD_UUID.equals(descriptor.getUuid())) {
           return;
@@ -196,7 +199,11 @@ public class TiBluetoothPeripheralProxy extends KrollProxy {
     }
   }
 
-  private synchronized void completeGattOperation() {
+  private synchronized void completeGattOperation(BluetoothGatt gatt) {
+    if (gatt != bluetoothGatt) {
+      Log.w(LCAT, "Ignoring a callback from an earlier connection");
+      return;
+    }
     gattBusy = false;
     startNextGattOperation();
   }
